@@ -15,3 +15,7 @@ usage:
 --output_dir input your output_dir
 --metadata_file: input your metadata
 --model_output: input where to stored your model
+
+
+# Funvisual
+Predict and make the visualization of the parameter for testing results
