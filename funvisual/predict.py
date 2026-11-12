@@ -3,8 +3,13 @@ import argparse
 import sqlite3
 import numpy as np
 import pandas as pd
-import joblib
+import os
+import sys
 from datetime import datetime
+
+# shared feature construction (../funml/features.py)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "funml"))
+import features as F  # noqa: E402
 
 
 # ---------------------------------------------------------
@@ -48,43 +53,29 @@ def load_label_maps(metadata_file):
 # ---------------------------------------------------------
 # Predict a single genome (one table)
 # ---------------------------------------------------------
-def predict_single_table(table_name, db_file, model_file):
+def predict_single_table(table_name, db_file, model_file, work_dir="."):
     print(f" Loading data from table: {table_name}")
-
-    conn = sqlite3.connect(db_file)
-    df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
+    conn = sqlite3.connect(F.decompress_db(db_file, work_dir))
+    df = F.load_table(conn, table_name)
     conn.close()
-
     if df.empty:
         raise ValueError(f" Table '{table_name}' is empty or does not exist!")
 
     print(" Loading trained model...")
-    model_species, model_condition, scaler, encoder = joblib.load(model_file)
+    bundle = F.load_model(model_file)
 
     print(" Encoding & scaling features...")
-    X_encoded = encoder.transform(df)
-    X_scaled = scaler.transform(X_encoded.toarray())
+    proba_species, proba_condition = F.predict_table(bundle, df)
 
-    proba_species = model_species.predict_proba(X_scaled)
-    proba_condition = model_condition.predict_proba(X_scaled)
-
-    proba_species = fix_nan_scores(proba_species, "Species")
-    proba_condition = fix_nan_scores(proba_condition, "Condition")
-
-    # Mean probabilities (genome-level)
+    # Genome-level probabilities: mean of the per-feature-vector posteriors; MAP decision
     mean_species = proba_species.mean(axis=0)
     mean_condition = proba_condition.mean(axis=0)
-
     species_idx = int(np.argmax(mean_species))
     condition_idx = int(np.argmax(mean_condition))
 
-    return (
-        species_idx,
-        mean_species,
-        condition_idx,
-        mean_condition,
-        df.shape[0],
-    )
+    species_map = dict(enumerate(bundle["species_classes"]))
+    condition_map = dict(enumerate(bundle["condition_classes"]))
+    return species_idx, mean_species, condition_idx, mean_condition, df.shape[0], species_map, condition_map
 
 
 # ---------------------------------------------------------
@@ -181,20 +172,15 @@ def main():
     )
     parser.add_argument("--db_file", required=True)
     parser.add_argument("--model_file", required=True)
-    parser.add_argument("--metadata_file", required=True)
+    parser.add_argument("--metadata_file", required=False,
+                        help="Not needed any more (class names are stored in the model); kept for compatibility")
     parser.add_argument("--table_name", required=True)
     parser.add_argument("--html_out", default="prediction_output.html",
                         help="Output HTML file name")
     args = parser.parse_args()
 
-    # Load label mappings
-    species_map, condition_map, species_list, condition_list = load_label_maps(
-        args.metadata_file
-    )
-
-    species_idx, species_probs, condition_idx, condition_probs, n_rows = predict_single_table(
-        args.table_name, args.db_file, args.model_file
-    )
+    (species_idx, species_probs, condition_idx, condition_probs, n_rows,
+     species_map, condition_map) = predict_single_table(args.table_name, args.db_file, args.model_file)
 
     # Normal terminal output
     print("\n============================")
