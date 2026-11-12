@@ -100,10 +100,11 @@ def add_metadata_entry(metadata_file, table_name, species, condition, isolate):
         "condition": condition,
         "isolate": isolate
     }
-    
-    metadata_df = metadata_df.append(new_entry, ignore_index=True)
-    metadata_df.to_csv(metadata_file, sep="\t", index=False)
 
+    # Use pd.concat instead of deprecated .append
+    metadata_df = pd.concat([metadata_df, pd.DataFrame([new_entry])], ignore_index=True)
+
+    metadata_df.to_csv(metadata_file, sep="\t", index=False)
     print(f"📋 Added metadata for table: {table_name}")
 
 def process_file(conn, cursor, filepath, species, condition, isolate, metadata_file):
