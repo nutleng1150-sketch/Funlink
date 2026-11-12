@@ -70,7 +70,7 @@ subprocess.run(fetch_command, check=True)
 
 # 3. Merge the linked output with previous annnotation
 merge_command = [
-    "python", os.path.join(program_path, "merge.py"), os.path.join(immediate_path, "merged_results.tsv"), os.path.join(immediate_path, "uniprot_map.tsv"), os.path.join(immediate_path, "draft_db.tsv"),
+    "python", os.path.join(program_path, "merge.py"), os.path.join(immediate_path, "merged_results.tsv"), os.path.join(immediate_path, "uniprot_map.txt"), os.path.join(immediate_path, "draft_db.tsv"),
 
 ]   
 
