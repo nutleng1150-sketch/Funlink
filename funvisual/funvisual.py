@@ -3,11 +3,9 @@ import argparse
 import sqlite3
 import numpy as np
 import pandas as pd
-import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.preprocessing import label_binarize
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     confusion_matrix, precision_recall_curve, average_precision_score,
@@ -15,6 +13,12 @@ from sklearn.metrics import (
 )
 
 from matplotlib.backends.backend_pdf import PdfPages
+import os
+import sys
+
+# shared feature construction (../funml/features.py)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "funml"))
+import features as F  # noqa: E402
 
 # -------------------------------------------------------------
 # Load tables safely
@@ -31,7 +35,8 @@ def plot_confusion_matrix(cm, class_list, title, filename, normalize=False):
     plt.figure(figsize=(8, 6))
 
     if normalize:
-        cm = cm.astype("float") / cm.sum(axis=1)[:, np.newaxis]
+        row_sums = cm.sum(axis=1)[:, np.newaxis]
+        cm = np.divide(cm.astype("float"), row_sums, out=np.zeros(cm.shape), where=row_sums > 0)
         fmt = ".2f"
     else:
         fmt = "d"
@@ -59,28 +64,21 @@ def plot_confusion_matrix(cm, class_list, title, filename, normalize=False):
 # -------------------------------------------------------------
 def plot_multiclass_pr(y_true_num, y_scores, class_list, title, filename):
     n_classes = len(class_list)
-    n_score_cols = y_scores.shape[1]
-
-    # Guard: shape mismatch or too few classes
-    if n_classes < 2:
-        print(f" Skipping PR plot '{title}' because there is only {n_classes} class.")
-        return
-
-    if n_score_cols != n_classes:
-        print(
-            f" Skipping PR plot '{title}' because y_scores has "
-            f"{n_score_cols} columns but there are {n_classes} classes."
-        )
-        return
-
-    y_bin = label_binarize(y_true_num, classes=list(range(n_classes)))
-
+    if n_classes < 2 or y_scores.shape[1] != n_classes:
+        print(f" Skipping PR plot '{title}': {n_classes} classes, {y_scores.shape[1]} score columns.")
+        return {}
+    # one-versus-rest indicator matrix (label_binarize returns a single column for two classes)
+    y_bin = np.eye(n_classes, dtype=int)[np.asarray(y_true_num)]
+    ap_values = {}
     plt.figure(figsize=(8, 6))
     for i in range(n_classes):
+        if y_bin[:, i].sum() == 0:
+            print(f" PR curve for '{class_list[i]}' skipped: class not present in the evaluated genomes.")
+            continue
         precision, recall, _ = precision_recall_curve(y_bin[:, i], y_scores[:, i])
         ap = average_precision_score(y_bin[:, i], y_scores[:, i])
+        ap_values[class_list[i]] = ap
         plt.plot(recall, precision, label=f"{class_list[i]} (AP={ap:.2f})")
-
     plt.xlabel("Recall")
     plt.ylabel("Precision")
     plt.title(title)
@@ -88,8 +86,8 @@ def plot_multiclass_pr(y_true_num, y_scores, class_list, title, filename):
     plt.tight_layout()
     plt.savefig(filename, dpi=300)
     plt.close()
-
     print(f" PR Curve saved: {filename}")
+    return ap_values
 
 # -------------------------------------------------------------
 # Class Distribution Plot
@@ -159,7 +157,7 @@ def plot_metric_bar(metrics, title, filename):
     names = list(metrics.keys())
     values = list(metrics.values())
 
-    sns.barplot(x=names, y=values, palette="Set2")
+    sns.barplot(x=names, y=values, hue=names, palette="Set2", legend=False)
     plt.ylim(0, 1)
     plt.title(title)
     plt.ylabel("Score")
@@ -226,136 +224,98 @@ def create_pdf_report(output_pdf):
 # -------------------------------------------------------------
 # Main Evaluation
 # -------------------------------------------------------------
-def evaluate(db_file, metadata_file, model_file, batch_size=5000):
+def evaluate(db_file, metadata_file, model_file, split="train", output_dir="."):
+    db_file, metadata_file, model_file = map(os.path.abspath, (db_file, metadata_file, model_file))
+    os.makedirs(output_dir, exist_ok=True)
+    os.chdir(output_dir)
 
     print(" Loading trained model...")
-    model_species, model_condition, scaler, encoder = joblib.load(model_file)
+    bundle = F.load_model(model_file)
+    species_classes, condition_classes = bundle["species_classes"], bundle["condition_classes"]
 
-    conn = sqlite3.connect(db_file)
-    metadata = pd.read_csv(metadata_file, sep="\t")
-    tables = get_table_names(conn)
+    meta = F.read_metadata(metadata_file)
+    if split != "all" and "split" in meta.columns:
+        tables = list(meta.index[meta["split"].str.lower() == split])
+    else:
+        tables = list(meta.index)
+    if not tables:
+        raise ValueError(f"No tables with split '{split}' in {metadata_file}")
 
-    true_species = []
-    true_condition = []
-    score_species_list = []
-    score_condition_list = []
-
-    print(f" Found {len(tables)} tables.")
-
+    db = F.decompress_db(db_file, ".")
+    conn = sqlite3.connect(db)
+    y_species, y_condition, p_species, p_condition = [], [], [], []
     for table_name in tables:
         print(f" Evaluating: {table_name}")
-
-        meta = metadata[metadata["table_name"] == table_name]
-        if meta.empty:
-            print(" No metadata found. Skipped.")
-            continue
-
-        species_label = meta["species"].values[0]
-        condition_label = meta["condition"].values[0]
-
-        query = f"SELECT * FROM {table_name}"
-        for chunk in pd.read_sql_query(query, conn, chunksize=batch_size):
-
-            true_species.extend([species_label] * len(chunk))
-            true_condition.extend([condition_label] * len(chunk))
-
-            X_encoded = encoder.transform(chunk)
-            X_scaled = scaler.transform(X_encoded.toarray())
-
-            score_species_list.append(model_species.predict_proba(X_scaled))
-            score_condition_list.append(model_condition.predict_proba(X_scaled))
-
+        df = F.load_table(conn, table_name)
+        ps, pc = F.predict_table(bundle, df)
+        p_species.append(ps)
+        p_condition.append(pc)
+        y_species += [species_classes.index(meta.loc[table_name, "species"])] * len(df)
+        y_condition += [condition_classes.index(meta.loc[table_name, "condition"])] * len(df)
     conn.close()
 
-    # Stack & fix NaN
-    score_species = fix_nan_scores(np.vstack(score_species_list), "Species")
-    score_condition = fix_nan_scores(np.vstack(score_condition_list), "Condition")
-
-    species_classes = sorted(list(set(true_species)))
-    condition_classes = sorted(list(set(true_condition)))
-
-    y_species_num = pd.Categorical(true_species, categories=species_classes).codes
-    y_condition_num = pd.Categorical(true_condition, categories=condition_classes).codes
-
+    score_species, score_condition = np.vstack(p_species), np.vstack(p_condition)
+    y_species_num, y_condition_num = np.array(y_species), np.array(y_condition)
     y_pred_species = score_species.argmax(axis=1)
     y_pred_condition = score_condition.argmax(axis=1)
 
-    # ---- Compute metrics ----
-    metric_summary = {
-        "Species": {
-            "Accuracy": accuracy_score(y_species_num, y_pred_species),
-            "Precision": precision_score(y_species_num, y_pred_species, average="weighted", zero_division=0),
-            "Recall": recall_score(y_species_num, y_pred_species, average="weighted", zero_division=0),
-            "F1-score": f1_score(y_species_num, y_pred_species, average="weighted", zero_division=0)
-        },
-        "Condition": {
-            "Accuracy": accuracy_score(y_condition_num, y_pred_condition),
-            "Precision": precision_score(y_condition_num, y_pred_condition, average="weighted", zero_division=0),
-            "Recall": recall_score(y_condition_num, y_pred_condition, average="weighted", zero_division=0),
-            "F1-score": f1_score(y_condition_num, y_pred_condition, average="weighted", zero_division=0)
-        }
-    }
+    def summary(y, yhat):
+        return {"Accuracy": accuracy_score(y, yhat),
+                "Precision": precision_score(y, yhat, average="weighted", zero_division=0),
+                "Recall": recall_score(y, yhat, average="weighted", zero_division=0),
+                "F1-score": f1_score(y, yhat, average="weighted", zero_division=0)}
+    metric_summary = {"Species": summary(y_species_num, y_pred_species),
+                      "Condition": summary(y_condition_num, y_pred_condition)}
 
-    # ---- Plot all results ----
-    plot_metric_summary_heatmap(metric_summary,
-                                "Performance Summary",
-                                "metric_summary_heatmap.png")
+    plot_metric_summary_heatmap(metric_summary, f"Performance Summary ({split} genomes)", "metric_summary_heatmap.png")
+    plot_metric_bar(metric_summary["Species"], "Metric Performance - Species", "metric_bar_species.png")
+    plot_metric_bar(metric_summary["Condition"], "Metric Performance - Condition", "metric_bar_condition.png")
 
-    plot_metric_bar(metric_summary["Species"],
-                    "Metric Performance – Species",
-                    "metric_bar_species.png")
+    cm_species = confusion_matrix(y_species_num, y_pred_species, labels=range(len(species_classes)))
+    plot_confusion_matrix(cm_species, species_classes, "Confusion Matrix - Species", "cm_species.png")
+    plot_confusion_matrix(cm_species, species_classes, "Normalized CM - Species", "cm_species_norm.png", normalize=True)
+    cm_condition = confusion_matrix(y_condition_num, y_pred_condition, labels=range(len(condition_classes)))
+    plot_confusion_matrix(cm_condition, condition_classes, "Confusion Matrix - Condition", "cm_condition.png")
+    plot_confusion_matrix(cm_condition, condition_classes, "Normalized CM - Condition", "cm_condition_norm.png", normalize=True)
 
-    plot_metric_bar(metric_summary["Condition"],
-                    "Metric Performance – Condition",
-                    "metric_bar_condition.png")
+    ap_species = plot_multiclass_pr(y_species_num, score_species, species_classes,
+                                    "Precision-Recall - Species", "pr_species.png")
+    ap_condition = plot_multiclass_pr(y_condition_num, score_condition, condition_classes,
+                                      "Precision-Recall - Condition", "pr_condition.png")
 
-    # Confusion Matrices
-    cm_species = confusion_matrix(y_species_num, y_pred_species)
-    plot_confusion_matrix(cm_species, species_classes, "Confusion Matrix – Species", "cm_species.png")
-    plot_confusion_matrix(cm_species, species_classes, "Normalized CM – Species", "cm_species_norm.png", normalize=True)
-
-    cm_condition = confusion_matrix(y_condition_num, y_pred_condition)
-    plot_confusion_matrix(cm_condition, condition_classes, "Confusion Matrix – Condition", "cm_condition.png")
-    plot_confusion_matrix(cm_condition, condition_classes, "Normalized CM – Condition", "cm_condition_norm.png", normalize=True)
-
-    # PR Curves (species will work, condition is skipped if invalid)
-    plot_multiclass_pr(y_species_num, score_species, species_classes,
-                       "Precision–Recall – Species", "pr_species.png")
-
-    plot_multiclass_pr(y_condition_num, score_condition, condition_classes,
-                       "Precision–Recall – Condition", "pr_condition.png")
-
-    # Distribution
-    plot_class_distribution(true_species, species_classes,
-                            "Class Distribution – Species", "dist_species.png")
-
-    plot_class_distribution(true_condition, condition_classes,
-                            "Class Distribution – Condition", "dist_condition.png")
-
-    # Per-class detailed metrics
+    plot_class_distribution([species_classes[i] for i in y_species_num], species_classes,
+                            "Class Distribution - Species", "dist_species.png")
+    plot_class_distribution([condition_classes[i] for i in y_condition_num], condition_classes,
+                            "Class Distribution - Condition", "dist_condition.png")
     plot_class_metric_heatmap(y_species_num, y_pred_species, species_classes,
-                              "Per-Class Metrics – Species", "species_class_metrics.png")
-
+                              "Per-Class Metrics - Species", "species_class_metrics.png")
     plot_class_metric_heatmap(y_condition_num, y_pred_condition, condition_classes,
-                              "Per-Class Metrics – Condition", "condition_class_metrics.png")
+                              "Per-Class Metrics - Condition", "condition_class_metrics.png")
 
-    # Final PDF report
+    rows = [{"task": t.lower(), "metric": m, "value": v} for t, d in metric_summary.items() for m, v in d.items()]
+    rows += [{"task": "species", "metric": f"AP {c}", "value": v} for c, v in ap_species.items()]
+    rows += [{"task": "condition", "metric": f"AP {c}", "value": v} for c, v in ap_condition.items()]
+    pd.DataFrame(rows).to_csv("funvisual_metrics.tsv", sep="\t", index=False)
+
     create_pdf_report("funvisual_report.pdf")
-
     print("\n Evaluation completed successfully!")
+    return metric_summary, ap_species, ap_condition
+
 
 # -------------------------------------------------------------
 # CLI
 # -------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Memory-safe evaluation visualization")
-    parser.add_argument("--db_file", required=True)
-    parser.add_argument("--metadata_file", required=True)
-    parser.add_argument("--model_file", required=True)
-    parser.add_argument("--batch_size", type=int, default=5000)
+    parser = argparse.ArgumentParser(description="Evaluation and visualization of the FunML classifiers")
+    parser.add_argument("--db_file", required=True, help="FunLink database (.db or .db.bz2)")
+    parser.add_argument("--metadata_file", required=True, help="Metadata TSV (with optional split column)")
+    parser.add_argument("--model_file", required=True, help="Model file written by funml.py")
+    parser.add_argument("--split", default="train", choices=["train", "test", "all"],
+                        help="Genomes to evaluate (default: train, i.e. resubstitution)")
+    parser.add_argument("--output_dir", default=".", help="Directory for figures and the PDF report")
     args = parser.parse_args()
+    evaluate(args.db_file, args.metadata_file, args.model_file, args.split, args.output_dir)
 
-    evaluate(args.db_file, args.metadata_file, args.model_file, args.batch_size)
 
 if __name__ == "__main__":
     main()
