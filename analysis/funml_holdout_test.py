@@ -218,6 +218,8 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    if args.work_dir:
+        os.makedirs(args.work_dir, exist_ok=True)
     db_file = decompress_db(args.db_bz2_file, args.work_dir or args.output_dir)
     meta = pd.read_csv(args.metadata_file, sep="\t").set_index("table_name")
     train_tables = list(meta.index[meta["split"] == "train"])

@@ -45,4 +45,4 @@ genomes, `--split all` evaluates every table in the metadata file. `predict.py` 
 per-feature-vector posteriors of one genome and reports the class with the highest mean (MAP).
 
 ## Analysis
-`analysis/` holds the scripts used for the manuscript (hold-out test, Figures 2-5); see its README.
+`analysis/` holds the hold-out test used for the manuscript (Table 2, Figure 5); see its README.
